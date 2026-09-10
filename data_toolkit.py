@@ -15,9 +15,9 @@ The loaders are designed around well-known research datasets, primarily:
   Hedge-fund strategy index returns developed by EDHEC-Risk Institute.
   Source/origin: EDHEC-Risk Institute / EDHEC Business School.
 
-Users should obtain the required source files from the relevant provider and
-store them locally. By default, the functions look for files in a ``data``
-directory next to this module. Every public loader accepts ``data_dir`` so the
+By default, the functions look for files in a ``data``
+directory next to this module, where datasets can be downloaded using "update" functions.
+Every public loader accepts ``data_dir`` so the
 same functions can be used with data stored anywhere else.
 """
 
@@ -25,14 +25,118 @@ from pathlib import Path
 
 import pandas as pd
 
+import pandas_datareader.data as web
 
-DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-KEN_FRENCH_DATA_LIBRARY = (
-    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html"
+DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "raw"
+
+KEN_FRENCH_BASE_URL = (
+    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp"
 )
-EDHEC_SOURCE = "EDHEC-Risk Institute / EDHEC Business School"
+    
+def update_ken_french_industries(n_inds=30, data_dir=DEFAULT_DATA_DIR):
+    """
+    Download the latest Kenneth French industry data and save
+    the monthly tables used by the toolkit.
+    """
+    
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
 
+    dataset = web.DataReader(
+        f"{n_inds}_Industry_Portfolios",
+        "famafrench",
+        start="1926-07-01"
+    )
+
+    tables = {
+        "vw_rets": dataset[0],
+        "ew_rets": dataset[1],
+        "nfirms": dataset[4],
+        "size": dataset[5],
+    }
+
+    for name, df in tables.items():
+        df = df.copy()
+
+        # Keep the YYYYMM format expected by the existing loaders
+        df.index = df.index.strftime("%Y%m")
+
+        df.to_csv(
+            data_dir / f"ind{n_inds}_m_{name}.csv"
+        )
+        
+def update_ken_french_factors(data_dir=DEFAULT_DATA_DIR):
+    """
+    Download the latest monthly Fama-French 3-factor data
+    and save it in the format expected by the toolkit.
+    """
+
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset = web.DataReader(
+        "F-F_Research_Data_Factors",
+        "famafrench",
+        start="1926-07-01"
+    )
+
+    ff3 = dataset[0].copy()
+    ff3.index = ff3.index.strftime("%Y%m")
+
+    ff3.to_csv(
+        data_dir / "F-F_Research_Data_Factors_m.csv"
+    )
+
+def update_ken_french_size_portfolios(data_dir=DEFAULT_DATA_DIR):
+    """
+    Download the latest monthly Fama-French size portfolios
+    and save the equal-weighted file expected by the toolkit.
+    """
+
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset = web.DataReader(
+        "Portfolios_Formed_on_ME",
+        "famafrench",
+        start="1926-07-01"
+    )
+
+    me = dataset[1].copy()   # equal-weighted monthly returns
+    me.index = me.index.strftime("%Y%m")
+
+    me.to_csv(
+        data_dir / "Portfolios_Formed_on_ME_monthly_EW.csv"
+    )
+    
+def update_edhec_hfi(data_dir=DEFAULT_DATA_DIR):
+    """
+    Download the latest available EDHEC hedge-fund index dataset
+    used by PerformanceAnalytics and save it under the filename
+    expected by this toolkit.
+    """
+
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    url = (
+        "https://raw.githubusercontent.com/braverock/"
+        "PerformanceAnalytics/refs/heads/master/data/edhec.csv"
+    )
+
+    hfi = pd.read_csv(url, index_col=0)
+
+    hfi.to_csv(
+        data_dir / "edhec-hedgefundindices.csv"
+    )
+    
+def update_all_data():
+    update_ken_french_industries()
+    update_ken_french_factors()
+    update_ken_french_size_portfolios()
+    update_edhec_hfi()
 
 def _as_data_dir(data_dir):
     """Return ``data_dir`` as an expanded, absolute :class:`pathlib.Path`."""
