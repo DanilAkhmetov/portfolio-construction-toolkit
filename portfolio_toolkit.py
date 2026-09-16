@@ -10,6 +10,7 @@ import numpy as np
 from numpy.linalg import inv
 from scipy.optimize import minimize
 import matplotlib.pyplot as plt
+import statsmodels.api as sm
 
 
 # -----------------------------------------------------------------------------
@@ -34,6 +35,28 @@ def drawdown(return_series: pd.Series):
         "Drawdown": drawdowns
     })
 
+def drawdown(return_series):
+    """
+    Takes a time SERIES of asset returns.
+    Computes and returns a DataFrame that contains:
+    - the wealth index
+    - the previous peaks
+    - percent drawdowns
+    If DataFrame: calculates dd
+    """
+    wealth_index = 1000 * (1 + return_series).cumprod()
+    previous_peaks = wealth_index.cummax()
+    drawdowns = (wealth_index - previous_peaks) / previous_peaks
+
+    if not isinstance(return_series, pd.Series):
+        return drawdowns
+    else:
+        
+        return pd.DataFrame({
+            "Wealth": wealth_index,
+            "Peaks": previous_peaks,
+            "Drawdown": drawdowns
+        })
 
 def semideviation(r):
     "negative SemiDeviation"
@@ -156,15 +179,25 @@ def annualize_vol(r, periods_per_year):
 
 def sharpe_ratio(r, riskfree_rate, periods_per_year):
     """
-    Computes the annualized Sharpe ratio of a set of returns.
+    Computes the annualized Sharpe ratio.
+
+    riskfree_rate can be:
+    - scalar: annual risk-free rate
+    - Series: periodic risk-free returns aligned with r
     """
-    rf_per_period = (1 + riskfree_rate) ** (1 / periods_per_year) - 1
 
-    excess_ret = r - rf_per_period
-    ann_ex_ret = annualize_rets(excess_ret, periods_per_year)
-    ann_vol = annualize_vol(r, periods_per_year)
+    if isinstance(riskfree_rate, pd.Series):
+        rf = riskfree_rate.reindex(r.index)
+        excess_ret = r - rf
 
-    return ann_ex_ret / ann_vol
+    else:
+        rf_per_period = (1 + riskfree_rate) ** (1 / periods_per_year) - 1
+        excess_ret = r - rf_per_period
+
+    ann_excess_ret = excess_ret.mean() * periods_per_year
+    ann_excess_vol = annualize_vol(excess_ret, periods_per_year)
+
+    return ann_excess_ret / ann_excess_vol
 
 
 # -----------------------------------------------------------------------------
@@ -1250,7 +1283,56 @@ def backtest_ws(r, estimation_window=60, weighting=weight_ew, **kwargs):
     returns = (weights * r).sum(axis="columns",  min_count=1) #mincount is to generate NAs if all inputs are NAs
     return returns
 
+"""modified for rebalancing """
 
+def backtest_ws_a(
+    r,estimation_window=60,weighting=weight_ew,rebalance_every=1,**kwargs
+    ):
+    
+    n_periods = r.shape[0]
+    
+    if not 1 <= estimation_window < n_periods:
+        raise ValueError("Invalid estimation_window")
+        
+    windows = [
+        (start, start + estimation_window)
+        for start in range(
+            0,
+            n_periods - estimation_window + 1,
+            rebalance_every
+        )
+    ]
+
+    weights = [
+        weighting(r.iloc[start:end], **kwargs)
+        for start, end in windows
+    ]
+
+    weight_dates = [
+        r.index[end - 1]
+        for start, end in windows
+    ]
+
+    weights = pd.DataFrame(
+        weights,
+        index=weight_dates,
+        columns=r.columns
+    )
+
+    # Hold each portfolio until the next rebalance
+    weights = (
+        weights
+        .reindex(r.index)
+        .ffill()
+        .shift(1)
+        .dropna()
+    )
+
+    returns = (
+        weights * r.loc[weights.index]
+    ).sum(axis="columns", min_count=1)
+
+    return returns
 # -----------------------------------------------------------------------------
 # COVARIANCE ESTIMATION
 # -----------------------------------------------------------------------------
@@ -1472,6 +1554,9 @@ def w_msr(sigma, mu, scale=True):
     Returns:
     - portfolio weights
     """
+    if isinstance(mu, pd.DataFrame):
+        mu = mu.squeeze()
+        
     w = inverse(sigma).dot(mu)
 
     if scale:
@@ -1488,7 +1573,342 @@ def w_star(delta, sigma, mu):
     """
     return inverse(sigma).dot(mu) / delta
 
+def w_mv(delta, sigma, mu, max_weight=0.30):
+    """
+    Computes constrained mean-variance optimal portfolio weights.
 
+    Maximizes:
+        w.T @ mu - delta/2 * w.T @ sigma @ w
+
+    Subject to:
+        weights sum to 1
+        0 <= w_i <= max_weight
+    """
+    if isinstance(mu, pd.DataFrame):
+        mu = mu.squeeze()
+
+    n = len(mu)
+    init_guess = np.repeat(1/n, n)
+
+    def neg_utility(w):
+        return -(w @ mu.values - delta/2 * w @ sigma.values @ w)
+
+    weights_sum_to_1 = {
+        "type": "eq",
+        "fun": lambda w: w.sum() - 1
+    }
+
+    bounds = ((0.0, max_weight),) * n
+
+    result = minimize(
+        neg_utility,
+        init_guess,
+        method="SLSQP",
+        options={
+        "ftol": 1e-12,
+        "maxiter": 1000
+        },
+        bounds=bounds,
+        constraints=weights_sum_to_1
+    )
+
+    if not result.success:
+        raise RuntimeError(
+            f"Mean-variance optimization failed: {result.message}"
+        )
+
+    return pd.Series(result.x, index=sigma.index)
+
+def bl_weights(w_prior, sigma_prior, p, q,
+               delta=2.5, tau=1/60,
+               omega=None, max_weight=0.30):
+    """
+    The `bl_weights()` function combines the two steps that have already been
+    implemented separately:
+    
+    1. `bl()` computes the Black–Litterman posterior expected returns and effective
+    covariance matrix.
+    2. `w_mv()` converts these posterior estimates into fully invested, long-only
+    portfolio weights subject to the 30% maximum weight constraint.
+    
+    """
+    mu_bl, sigma_bl = bl(
+        w_prior=w_prior,
+        sigma_prior=sigma_prior,
+        p=p,
+        q=q,
+        omega=omega,
+        delta=delta,
+        tau=tau
+    )
+
+    weights = w_mv(
+        delta=delta,
+        sigma=sigma_bl,
+        mu=mu_bl,
+        max_weight=max_weight
+    )
+
+    return weights
+
+    
+def weighting_bl(r,cap_weights,view_func,delta=2.5,tau=1/60,max_weight=0.30,**kwargs):
+
+    # Covariance from the current 60-month window
+    sigma = shrinkage_cov(r, delta=0.5) * 12
+
+    # Market weights available at the end of the window
+    w_mkt = cap_weights.loc[r.index[-1]]
+
+    # Market-implied equilibrium excess returns
+    pi = implied_rets(
+        delta=delta,
+        sigma=sigma,
+        w=w_mkt
+    )
+
+    # Absolute views on all 12 industries
+    p = pd.DataFrame(
+        np.eye(len(r.columns)),
+        index=r.columns,
+        columns=r.columns
+    )
+
+    # Generate Q using the chosen forecasting method
+    q = view_func(
+        r=r,
+        pi=pi,
+        w_mkt=w_mkt,
+        **kwargs
+        )
+
+    return bl_weights(
+        w_prior=w_mkt,
+        sigma_prior=sigma,
+        p=p,
+        q=q,
+        delta=delta,
+        tau=tau,
+        max_weight=max_weight
+    )
+    
+def neutral_views(r, pi, **kwargs):
+    return pi.copy()
+
+def historical_views(r, pi, rf, **kwargs):
+
+    rf_window = rf.loc[r.index]
+
+    excess_rets = r.sub(rf_window, axis=0)
+
+    q = excess_rets.mean() * 12
+
+    return q
+
+
+def momentum_views(r, pi, full_rets, forward_12m_excess, **kwargs):
+
+    """
+    Generates Black–Litterman views from cross-sectional momentum.
+
+    Momentum is measured using lagged cumulative returns, standardized across
+    industries, and mapped into expected 12-month excess returns using a pooled
+    historical OLS regression.
+    """
+
+    current_date = r.index[-1]
+
+    momentum_raw = (1 + full_rets.shift(1)).rolling(11).apply(np.prod) - 1
+
+    momentum_z = momentum_raw.sub(momentum_raw.mean(axis=1), axis=0).div(momentum_raw.std(axis=1), axis=0)
+
+    z_current = momentum_z.loc[current_date]
+
+    current_pos = full_rets.index.get_loc(current_date)
+    last_usable_date = full_rets.index[current_pos - 12]
+
+    train = pd.DataFrame({
+        "z": momentum_z.loc[:last_usable_date].stack(),
+        "future_excess": forward_12m_excess.loc[:last_usable_date].stack()
+    }).dropna()
+
+    X = sm.add_constant(train["z"])
+    model = sm.OLS(train["future_excess"], X).fit()
+
+    return model.params["const"] + model.params["z"] * z_current
+    
+
+def factor_views(r, pi, ff_factors, **kwargs):
+    """
+    Generates Black–Litterman views from a Fama–French 3-factor model.
+    """
+
+    factors = ff_factors.loc[r.index, ["Mkt-RF", "SMB", "HML"]]
+    rf = ff_factors.loc[r.index, "RF"]
+
+    factor_premia = factors.mean() * 12
+
+    q = pd.Series(index=r.columns, dtype=float)
+
+    X = sm.add_constant(factors)
+
+    for industry in r.columns:
+        y = r[industry] - rf
+        model = sm.OLS(y, X).fit()
+
+        q[industry] = (
+            + model.params["Mkt-RF"] * factor_premia["Mkt-RF"]
+            + model.params["SMB"] * factor_premia["SMB"]
+            + model.params["HML"] * factor_premia["HML"]
+        )
+
+    return q
+
+
+def compute_factor_score_history(full_rets, ff_factors, window=60):
+    """
+    Precomputes cross-sectional SMB/HML factor scores for all dates.
+    """
+
+    factor_score_hist = pd.DataFrame(
+        index=full_rets.index,
+        columns=full_rets.columns,
+        dtype=float
+    )
+
+    for end in range(window - 1, len(full_rets)):
+        current_date = full_rets.index[end]
+
+        r_window = full_rets.iloc[end-window+1:end+1]
+
+        factors_window = ff_factors.loc[
+            r_window.index,
+            ["Mkt-RF", "SMB", "HML"]
+        ]
+
+        rf_window = ff_factors.loc[r_window.index, "RF"]
+
+        factor_premia = (
+            ff_factors.loc[:current_date, ["SMB", "HML"]]
+            .mean()
+            * 12
+        )
+
+        X = sm.add_constant(factors_window)
+
+        scores = pd.Series(index=full_rets.columns, dtype=float)
+
+        for industry in full_rets.columns:
+            y = r_window[industry] - rf_window
+
+            model = sm.OLS(y, X).fit()
+
+            scores[industry] = (
+                model.params["SMB"] * factor_premia["SMB"]
+                + model.params["HML"] * factor_premia["HML"]
+            )
+
+        factor_score_hist.loc[current_date] = (
+            scores - scores.mean()
+        ) / scores.std()
+
+    return factor_score_hist
+
+def factor_views_adjusted(r,pi,factor_score_hist, forward_12m_excess,**kwargs):
+    """
+    Generates BL views from historically calibrated factor scores.
+    """
+
+    current_date = r.index[-1]
+
+    z_current = factor_score_hist.loc[current_date]
+
+    current_pos = factor_score_hist.index.get_loc(current_date)
+    last_usable_date = factor_score_hist.index[current_pos - 12]
+
+    z_train = factor_score_hist.loc[:last_usable_date]
+    y_train = forward_12m_excess.loc[:last_usable_date]
+
+    train = pd.DataFrame({
+        "z": z_train.stack(),
+        "future_excess": y_train.stack()
+    }).dropna()
+
+    X = sm.add_constant(train["z"])
+    model = sm.OLS(train["future_excess"], X).fit()
+
+    return pi + model.params["z"] * z_current
+
+def factor_views_simple(r, pi, ff_factors, **kwargs):
+    """
+    Generates BL views by tilting the prior toward industries
+    exposed to factors with positive expected premia.
+    """
+
+    current_date = r.index[-1]
+
+    factors = ff_factors.loc[
+        r.index,
+        ["Mkt-RF", "SMB", "HML"]
+    ]
+
+    rf = ff_factors.loc[r.index, "RF"]
+
+    factor_premia = (
+        ff_factors.loc[:current_date, ["SMB", "HML"]]
+        .mean()
+        * 12
+    )
+
+    winning_premia = factor_premia.clip(lower=0)
+
+    X = sm.add_constant(factors)
+
+    factor_tilt = pd.Series(index=r.columns, dtype=float)
+
+    for industry in r.columns:
+        y = r[industry] - rf
+        model = sm.OLS(y, X).fit()
+
+        factor_tilt[industry] = (
+            model.params["SMB"] * winning_premia["SMB"]
+            + model.params["HML"] * winning_premia["HML"]
+        )
+
+    factor_tilt = factor_tilt - factor_tilt.mean()
+
+    return pi + factor_tilt
+
+def factor_views_value(r, pi, ff_factors, **kwargs):
+    """
+    Generates BL views by tilting the prior toward industries
+    with positive exposure to the value factor.
+    """
+
+    current_date = r.index[-1]
+
+    factors = ff_factors.loc[r.index, ["Mkt-RF", "HML"]]
+    rf = ff_factors.loc[r.index, "RF"]
+
+    hml_premium = ff_factors.loc[:current_date, "HML"].mean() * 12
+    hml_premium = max(hml_premium, 0)
+
+    X = sm.add_constant(factors)
+
+    factor_tilt = pd.Series(index=r.columns, dtype=float)
+
+    for industry in r.columns:
+        y = r[industry] - rf
+        model = sm.OLS(y, X).fit()
+
+        factor_tilt[industry] = (
+            model.params["HML"] * hml_premium
+        )
+
+    factor_tilt = factor_tilt - factor_tilt.mean()
+
+    return pi + factor_tilt
+    
 # -----------------------------------------------------------------------------
 # RISK BUDGETING AND EQUAL RISK CONTRIBUTION
 # -----------------------------------------------------------------------------
@@ -1556,3 +1976,8 @@ def risk_parity_weights(cov):
     n = cov.shape[0]
 
     return target_risk_contribution(target = np.repeat(1/n, cov.shape[0]),cov=cov)
+
+    
+def weight_rp(r, cov_estimator=shrinkage_cov, **kwargs):
+    cov = cov_estimator(r, **kwargs)
+    return risk_parity_weights(cov)
