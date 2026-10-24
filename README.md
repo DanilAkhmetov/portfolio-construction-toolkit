@@ -75,6 +75,7 @@ This small project brings together reusable implementations of portfolio constru
 - Proportional-prior Omega construction
 - Black-Litterman posterior expected returns and covariance
 - Mean-variance and Maximum Sharpe portfolio weights from posterior estimates
+- View Generation Methods + Backtest Functions updates (enabling backtesting BL)
 
 ### Risk budgeting & Risk Parity Portfolios
 
