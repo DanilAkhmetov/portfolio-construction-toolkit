@@ -347,14 +347,14 @@ def plot_ef(n_points, er, cov, show_cml = False, show_ew = False,
     return ax
 
 
-def msr(rf, er, cov):
+def msr(rf, er, cov, max_weight = 1):
     """
     Returns the weights that maximize SR
     """
     n = er.shape[0]
 
     init_guess = np.repeat(1/n, n)
-    bounds = ((0.0, 1.0),) * n
+    bounds = ((0.0, max_weight ),) * n
 
     weights_sum_to_1 = {
         'type':'eq',
@@ -380,13 +380,13 @@ def msr(rf, er, cov):
     return results.x
 
 
-def gmv(cov):
+def gmv(cov, max_weight =1):
     """
     Returns the weights of the Global Minimum Volatility portfolio
     given a covariance matrix
     """
     n = cov.shape[0]
-    return msr(0, np.repeat(1, n), cov)
+    return msr(0, np.repeat(1, n), cov, max_weight = max_weight)
 
 
 # -----------------------------------------------------------------------------
@@ -1380,13 +1380,13 @@ def cc_cov(r, **kwargs):
     return pd.DataFrame(ccov, index=r.columns, columns=r.columns)
 
 
-def weight_gmv(r, cov_estimator = sample_cov, **kwargs):
+def weight_gmv(r, cov_estimator = sample_cov, max_weight = 1.0, **kwargs):
     """
     Produces the weights of the GMV portfolio given a covariance matrix of the returns
     """
     est = cov_estimator(r, **kwargs)
 
-    return gmv(est)
+    return gmv(est, max_weight = max_weight)
 
 
 def shrinkage_cov(r, delta=0.5, **kwargs):
@@ -1737,6 +1737,44 @@ def momentum_views(r, pi, full_rets, forward_12m_excess, **kwargs):
 
     return model.params["const"] + model.params["z"] * z_current
     
+def momentum_views_v2(r, pi, full_rets, forward_12m_excess, **kwargs):
+    """
+    This version relaxes the assumption that momentum has the same predictive relationship across all
+    industries. 
+    Instead of pooling all industries into one regression, a separate OLS regression is estimated for each
+    industry
+    """
+    current_date = r.index[-1]
+
+    momentum_raw = (1 + full_rets.shift(1)).rolling(11).apply(np.prod) - 1
+
+    momentum_z = momentum_raw.sub(momentum_raw.mean(axis=1), axis=0).div(momentum_raw.std(axis=1), axis=0)
+
+    z_current = momentum_z.loc[current_date]
+
+    current_pos = full_rets.index.get_loc(current_date)
+    last_usable_date = full_rets.index[current_pos - 12]
+
+
+    q = pd.Series(dtype = float)
+    
+    for ind in momentum_z.columns:
+        train_ind = pd.DataFrame({
+        "z": momentum_z.loc[:last_usable_date, ind],
+        "future_excess": forward_12m_excess.loc[:last_usable_date, ind]
+    }).dropna()
+        
+        X = sm.add_constant(train_ind["z"])
+        y = train_ind["future_excess"]
+
+        model = sm.OLS(y, X).fit()
+
+        q[ind] = (
+            model.params["const"]
+            + model.params["z"] * z_current[ind]
+        )
+
+    return q
 
 def factor_views(r, pi, ff_factors, **kwargs):
     """
@@ -1934,7 +1972,7 @@ def risk_contribution(w, cov):
     return pct_contrib
 
 
-def target_risk_contribution(target, cov):
+def target_risk_contribution(target, cov, max_weight=1):
 
     def ssd(weights, target, cov):
         return ((risk_contribution(weights, cov) - target)**2).sum()
@@ -1947,7 +1985,7 @@ def target_risk_contribution(target, cov):
         "fun": lambda weights: np.sum(weights) - 1
     }
 
-    bounds = ((0.0, 1.0),) * n
+    bounds = ((0.0, max_weight),) * n
 
     results = minimize(
         ssd,
@@ -1958,26 +1996,33 @@ def target_risk_contribution(target, cov):
         constraints=(weights_sum_to_1,),
         bounds=bounds
     )
+
     if not results.success:
-        raise RuntimeError(f"Risk-contribution optimization failed: {results.message}")
+        raise RuntimeError(
+            f"Risk-contribution optimization failed: {results.message}"
+        )
 
     return results.x
 
 
-def risk_parity_weights(cov):
-    """
-    Computes Equal Risk Contribution / Risk Parity weights.
-
-    Target risk contribution for each asset:
-
-        1 / n
-    """
+def risk_parity_weights(cov, max_weight=1):
 
     n = cov.shape[0]
 
-    return target_risk_contribution(target = np.repeat(1/n, cov.shape[0]),cov=cov)
+    return target_risk_contribution(
+        target=np.repeat(1/n, n),
+        cov=cov,
+        max_weight=max_weight
+    )
 
-    
+
 def weight_rp(r, cov_estimator=shrinkage_cov, **kwargs):
+
+    max_weight = kwargs.pop("max_weight", 1)
+
     cov = cov_estimator(r, **kwargs)
-    return risk_parity_weights(cov)
+
+    return risk_parity_weights(
+        cov,
+        max_weight=max_weight
+    )
