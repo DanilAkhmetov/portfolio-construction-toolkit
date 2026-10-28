@@ -388,6 +388,43 @@ def gmv(cov, max_weight =1):
     n = cov.shape[0]
     return msr(0, np.repeat(1, n), cov, max_weight = max_weight)
 
+from scipy.optimize import minimize
+
+def gmv_star(cov, max_weight=1):
+    """
+    Unlike the original gmv() function, which obtains the GMV portfolio indirectly 
+    through a maximum-Sharpe optimization with identical expected returns, 
+    gmv_star() minimizes portfolio variance directly.
+    """
+    n = cov.shape[0]
+
+    init_guess = np.repeat(1/n, n)
+
+    bounds = ((0, max_weight),) * n
+
+    constraints = {
+        "type": "eq",
+        "fun": lambda w: np.sum(w) - 1
+    }
+
+    def portfolio_variance(w):
+        return w.T @ cov @ w
+
+    results = minimize(
+        portfolio_variance,
+        init_guess,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints
+    )
+
+    if not results.success:
+        raise RuntimeError(
+            f"GMV optimization failed: {results.message}"
+        )
+
+    return results.x
+
 
 # -----------------------------------------------------------------------------
 # DYNAMIC ALLOCATION AND SIMULATION
